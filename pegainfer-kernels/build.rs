@@ -364,7 +364,11 @@ fn nvcc_supported_arches(nvcc: &NvccCommand) -> Option<BTreeSet<String>> {
     )
 }
 
-fn normalize_nvcc_sm(sm: &str, supported_arches: Option<&BTreeSet<String>>) -> String {
+fn normalize_nvcc_sm(
+    sm: &str,
+    supported_arches: Option<&BTreeSet<String>>,
+    nvcc: &NvccCommand,
+) -> String {
     let preferred = match sm {
         "120" | "120f" => Some("120f"),
         "121" | "121a" => Some("121a"),
@@ -376,7 +380,8 @@ fn normalize_nvcc_sm(sm: &str, supported_arches: Option<&BTreeSet<String>>) -> S
         }
         let raw = sm_numeric_prefix(sm).map_or_else(|| sm.to_string(), |sm| sm.to_string());
         println!(
-            "cargo:warning=nvcc does not list compute_{preferred}; compiling CUDA kernels for raw sm_{raw}"
+            "cargo:warning={} does not list compute_{preferred}; compiling CUDA kernels for raw sm_{raw}",
+            nvcc.display()
         );
         return raw;
     }
@@ -387,7 +392,7 @@ fn normalize_nvcc_sms(sm_targets: &[String], nvcc: &NvccCommand) -> Vec<String> 
     let supported_arches = nvcc_supported_arches(nvcc);
     sm_targets
         .iter()
-        .map(|sm| normalize_nvcc_sm(sm, supported_arches.as_ref()))
+        .map(|sm| normalize_nvcc_sm(sm, supported_arches.as_ref(), nvcc))
         .collect()
 }
 
@@ -500,13 +505,17 @@ fn nvcc_accepts_gencode(nvcc: &NvccCommand, compute: &str, sm: &str) -> bool {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
             println!(
-                "cargo:warning=nvcc rejected compute_{compute}/sm_{sm} probe: {}",
+                "cargo:warning={} rejected compute_{compute}/sm_{sm} probe: {}",
+                nvcc.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
             false
         }
         Err(err) => {
-            println!("cargo:warning=Failed to run nvcc arch probe: {err}");
+            println!(
+                "cargo:warning=Failed to run {} arch probe: {err}",
+                nvcc.display()
+            );
             false
         }
     }
@@ -545,7 +554,8 @@ fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &NvccCommand
                     Some(("90a", "90a", "sm_90a"))
                 } else {
                     println!(
-                        "cargo:warning=nvcc cannot compile compute_90a/sm_90a; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
+                        "cargo:warning={} cannot compile compute_90a/sm_90a; GLM5.2 FlashMLA sparse decode will use sm_{sm}",
+                        nvcc.display()
                     );
                     Some((sm.as_str(), sm.as_str(), "native"))
                 }
@@ -555,7 +565,8 @@ fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &NvccCommand
                     Some(("100f", "100f", "sm_100f"))
                 } else {
                     println!(
-                        "cargo:warning=nvcc cannot compile compute_100f/sm_100f; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
+                        "cargo:warning={} cannot compile compute_100f/sm_100f; GLM5.2 FlashMLA sparse decode will use sm_{sm}",
+                        nvcc.display()
                     );
                     Some((sm.as_str(), sm.as_str(), "native"))
                 }
@@ -2049,7 +2060,8 @@ fn tilelang_nvcc_tasks(
             .unwrap_or_default();
         let Some(gencode) = tilelang_gencode(&arch, nvcc) else {
             println!(
-                "cargo:warning=nvcc cannot assemble {arch}, which the {label} TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
+                "cargo:warning={} cannot assemble {arch}, which the {label} TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs",
+                nvcc.display()
             );
             return None;
         };
@@ -2251,7 +2263,10 @@ fn main() {
     );
 
     let nvcc_jobs = nvcc_job_count();
-    println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
+    println!(
+        "cargo:warning=Compiling CUDA translation units with {} across {nvcc_jobs} job(s)",
+        nvcc.display()
+    );
     let flashinfer = flashinfer_includes();
     println!(
         "cargo:warning=Using FlashInfer include dir: {}",
