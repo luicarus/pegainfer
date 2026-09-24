@@ -9,8 +9,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
-use pegainfer_build::NvccCommand;
-
 struct TritonKernelSpec {
     artifact_dir: &'static str,
     kernel_path: &'static str,
@@ -348,8 +346,20 @@ fn parse_sm_token(raw: &str) -> Option<String> {
     None
 }
 
-fn nvcc_supported_arches(nvcc: &NvccCommand) -> Option<BTreeSet<String>> {
-    let output = nvcc.command().arg("--list-gpu-arch").output().ok()?;
+/// `nvcc`, prefixed by `PEGAINFER_NVCC_LAUNCHER` when that is set and non-empty.
+fn nvcc_command(nvcc: &str) -> Command {
+    match std::env::var_os("PEGAINFER_NVCC_LAUNCHER").filter(|value| !value.is_empty()) {
+        Some(launcher) => {
+            let mut command = Command::new(launcher);
+            command.arg(nvcc);
+            command
+        }
+        None => Command::new(nvcc),
+    }
+}
+
+fn nvcc_supported_arches(nvcc: &str) -> Option<BTreeSet<String>> {
+    let output = nvcc_command(nvcc).arg("--list-gpu-arch").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -364,11 +374,7 @@ fn nvcc_supported_arches(nvcc: &NvccCommand) -> Option<BTreeSet<String>> {
     )
 }
 
-fn normalize_nvcc_sm(
-    sm: &str,
-    supported_arches: Option<&BTreeSet<String>>,
-    nvcc: &NvccCommand,
-) -> String {
+fn normalize_nvcc_sm(sm: &str, supported_arches: Option<&BTreeSet<String>>) -> String {
     let preferred = match sm {
         "120" | "120f" => Some("120f"),
         "121" | "121a" => Some("121a"),
@@ -380,19 +386,18 @@ fn normalize_nvcc_sm(
         }
         let raw = sm_numeric_prefix(sm).map_or_else(|| sm.to_string(), |sm| sm.to_string());
         println!(
-            "cargo:warning={} does not list compute_{preferred}; compiling CUDA kernels for raw sm_{raw}",
-            nvcc.display()
+            "cargo:warning=nvcc does not list compute_{preferred}; compiling CUDA kernels for raw sm_{raw}"
         );
         return raw;
     }
     sm.to_string()
 }
 
-fn normalize_nvcc_sms(sm_targets: &[String], nvcc: &NvccCommand) -> Vec<String> {
+fn normalize_nvcc_sms(sm_targets: &[String], nvcc: &str) -> Vec<String> {
     let supported_arches = nvcc_supported_arches(nvcc);
     sm_targets
         .iter()
-        .map(|sm| normalize_nvcc_sm(sm, supported_arches.as_ref(), nvcc))
+        .map(|sm| normalize_nvcc_sm(sm, supported_arches.as_ref()))
         .collect()
 }
 
@@ -471,7 +476,7 @@ fn nvcc_arch_args(normalized_sms: &[String]) -> Vec<String> {
     args
 }
 
-fn nvcc_accepts_gencode(nvcc: &NvccCommand, compute: &str, sm: &str) -> bool {
+fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
     let stem = format!(
         "pegainfer_nvcc_probe_{}_compute_{compute}_sm_{sm}",
         std::process::id()
@@ -489,8 +494,7 @@ fn nvcc_accepts_gencode(nvcc: &NvccCommand, compute: &str, sm: &str) -> bool {
         return false;
     }
 
-    let output = nvcc
-        .command()
+    let output = nvcc_command(nvcc)
         .args(["-c"])
         .arg(&cu_path)
         .arg("-o")
@@ -505,23 +509,19 @@ fn nvcc_accepts_gencode(nvcc: &NvccCommand, compute: &str, sm: &str) -> bool {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
             println!(
-                "cargo:warning={} rejected compute_{compute}/sm_{sm} probe: {}",
-                nvcc.display(),
+                "cargo:warning=nvcc rejected compute_{compute}/sm_{sm} probe: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
             false
         }
         Err(err) => {
-            println!(
-                "cargo:warning=Failed to run {} arch probe: {err}",
-                nvcc.display()
-            );
+            println!("cargo:warning=Failed to run nvcc arch probe: {err}");
             false
         }
     }
 }
 
-fn glm52_fp8_gemm_arch_args(normalized_sms: &[String], nvcc: &NvccCommand) -> Option<Vec<String>> {
+fn glm52_fp8_gemm_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     for sm in normalized_sms {
         let numeric = sm_numeric_prefix(sm)?;
@@ -538,7 +538,7 @@ fn glm52_fp8_gemm_arch_args(normalized_sms: &[String], nvcc: &NvccCommand) -> Op
     (!args.is_empty()).then_some(args)
 }
 
-fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &NvccCommand) -> Vec<String> {
+fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String> {
     let sm90a_supported = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a")
         && nvcc_accepts_gencode(nvcc, "90a", "90a");
     let sm100f_supported = normalized_sms
@@ -554,8 +554,7 @@ fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &NvccCommand
                     Some(("90a", "90a", "sm_90a"))
                 } else {
                     println!(
-                        "cargo:warning={} cannot compile compute_90a/sm_90a; GLM5.2 FlashMLA sparse decode will use sm_{sm}",
-                        nvcc.display()
+                        "cargo:warning=nvcc cannot compile compute_90a/sm_90a; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
                     );
                     Some((sm.as_str(), sm.as_str(), "native"))
                 }
@@ -565,8 +564,7 @@ fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &NvccCommand
                     Some(("100f", "100f", "sm_100f"))
                 } else {
                     println!(
-                        "cargo:warning={} cannot compile compute_100f/sm_100f; GLM5.2 FlashMLA sparse decode will use sm_{sm}",
-                        nvcc.display()
+                        "cargo:warning=nvcc cannot compile compute_100f/sm_100f; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
                     );
                     Some((sm.as_str(), sm.as_str(), "native"))
                 }
@@ -614,7 +612,7 @@ fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &NvccCommand
 /// Blackwell-only: assembled as sm_100f (tcgen05). Hopper SM90A path removed.
 fn glm52_deepgemm_mqa_arch_args(
     normalized_sms: &[String],
-    nvcc: &NvccCommand,
+    nvcc: &str,
 ) -> Option<(Vec<String>, String)> {
     let has_sm100 = normalized_sms
         .iter()
@@ -636,10 +634,7 @@ fn glm52_deepgemm_mqa_arch_args(
 /// ONLY (family arch — runs on the whole sm_10x line, incl. GB300's sm_103).
 /// Returns `None` when no sm_100 target is present (or nvcc lacks 100f); the
 /// TU then compiles its NOT_SUPPORTED stub for the requested targets instead.
-fn glm52_sm100f_only_arch_args(
-    normalized_sms: &[String],
-    nvcc: &NvccCommand,
-) -> Option<Vec<String>> {
+fn glm52_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
     let has_sm100 = normalized_sms
         .iter()
         .any(|sm| sm_numeric_prefix(sm).is_some_and(|n| (100..120).contains(&n)));
@@ -656,7 +651,7 @@ fn glm52_sm100f_only_arch_args(
 /// follows the same sm_100f-family rule as the GLM5.2 DeepGEMM stems: assemble
 /// for the family arch when a sm_100 target exists, otherwise let the TU fall
 /// back to its NOT_SUPPORTED stub.
-fn k3_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &NvccCommand) -> Option<Vec<String>> {
+fn k3_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
     glm52_sm100f_only_arch_args(normalized_sms, nvcc)
 }
 
@@ -665,7 +660,7 @@ fn k3_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &NvccCommand) -> Op
 /// 90a/100a/103a/120a with one code path. Compile the accelerated variant of
 /// every requested target that nvcc accepts; `None` means no target can carry
 /// the kernel and the TU falls back to its NOT_SUPPORTED stub.
-fn k3_flash_kda_arch_args(normalized_sms: &[String], nvcc: &NvccCommand) -> Option<Vec<String>> {
+fn k3_flash_kda_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     for sm in normalized_sms {
         let Some(numeric) = sm_numeric_prefix(sm) else {
@@ -902,7 +897,7 @@ fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
 /// that stay unresolved in the .so — the harness dlopens with `RTLD_LAZY` and
 /// never calls into DeepEP for these units.
 fn link_kernel_lab_shared(
-    nvcc: &NvccCommand,
+    nvcc: &str,
     toolkit: &pegainfer_build::CudaToolkit,
     out_dir: &Path,
     obj_files: &[PathBuf],
@@ -927,7 +922,7 @@ fn link_kernel_lab_shared(
         "-lstdc++".to_string(),
     ]);
     let status = time_phase("nvcc -shared libglm52_kernel_lab.so", || {
-        nvcc.command()
+        nvcc_command(nvcc)
             .args(&args)
             .status()
             .expect("Failed to run nvcc for libglm52_kernel_lab.so")
@@ -1764,7 +1759,7 @@ fn tilelang_arch(sm_targets: &[String]) -> Option<String> {
 /// the highest SM only. `None` means this nvcc cannot assemble that arch, and
 /// the caller falls back to the stub tier rather than emitting objects that
 /// would fail to link or run.
-fn tilelang_gencode(arch: &str, nvcc: &NvccCommand) -> Option<Vec<String>> {
+fn tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
     let target = arch.strip_prefix("sm_")?;
     nvcc_accepts_gencode(nvcc, target, target).then(|| {
         vec![
@@ -2028,7 +2023,7 @@ fn tilelang_nvcc_tasks(
     cuda_include: &Path,
     arch_args: &[String],
     sm_targets: &[String],
-    nvcc: &NvccCommand,
+    nvcc: &str,
 ) -> Vec<NvccTask> {
     let label = family.label;
     for knob in ["PYTHON", "PREGEN", "JOBS"] {
@@ -2060,8 +2055,7 @@ fn tilelang_nvcc_tasks(
             .unwrap_or_default();
         let Some(gencode) = tilelang_gencode(&arch, nvcc) else {
             println!(
-                "cargo:warning={} cannot assemble {arch}, which the {label} TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs",
-                nvcc.display()
+                "cargo:warning=nvcc cannot assemble {arch}, which the {label} TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
             );
             return None;
         };
@@ -2147,13 +2141,13 @@ fn main() {
     ensure_git_submodules_initialized(&workspace_root());
 
     let toolkit = pegainfer_build::CudaToolkit::discover();
-    let nvcc = &toolkit.nvcc;
+    let nvcc = toolkit.nvcc.to_string_lossy().into_owned();
     let cuda_include = toolkit
         .header_dir("cuda.h")
         .unwrap_or_else(|| toolkit.root.join("include"));
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
-    let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, nvcc);
+    let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let moe_enabled = cfg!(feature = "moe");
@@ -2263,10 +2257,7 @@ fn main() {
     );
 
     let nvcc_jobs = nvcc_job_count();
-    println!(
-        "cargo:warning=Compiling CUDA translation units with {} across {nvcc_jobs} job(s)",
-        nvcc.display()
-    );
+    println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
     let flashinfer = flashinfer_includes();
     println!(
         "cargo:warning=Using FlashInfer include dir: {}",
@@ -2292,17 +2283,17 @@ fn main() {
             csrc_dir.to_string_lossy().to_string(),
         ];
         if stem == "glm52_fp8_gemm" {
-            if let Some(args) = glm52_fp8_gemm_arch_args(&nvcc_sm_targets, nvcc) {
+            if let Some(args) = glm52_fp8_gemm_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(args);
                 nvcc_args.push("-DGLM52_FP8_GEMM_SM100A".to_string());
             } else {
                 nvcc_args.extend(arch_args.clone());
             }
         } else if stem == "glm52_flashmla_sparse" {
-            nvcc_args.extend(glm52_flashmla_sparse_arch_args(&nvcc_sm_targets, nvcc));
+            nvcc_args.extend(glm52_flashmla_sparse_arch_args(&nvcc_sm_targets, &nvcc));
         } else if stem == "glm52_deepgemm_mqa" {
             if let Some((mqa_args, mqa_define)) =
-                glm52_deepgemm_mqa_arch_args(&nvcc_sm_targets, nvcc)
+                glm52_deepgemm_mqa_arch_args(&nvcc_sm_targets, &nvcc)
             {
                 nvcc_args.extend(mqa_args);
                 nvcc_args.push(mqa_define);
@@ -2313,7 +2304,7 @@ fn main() {
                 nvcc_args.extend(arch_args.clone());
             }
         } else if stem == "glm52_deepgemm_grouped_sm100" {
-            if let Some(sm100f_args) = glm52_sm100f_only_arch_args(&nvcc_sm_targets, nvcc) {
+            if let Some(sm100f_args) = glm52_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(sm100f_args);
                 nvcc_args.push("-DGLM52_DEEPGEMM_GROUPED_SM100F".to_string());
             } else {
@@ -2324,7 +2315,7 @@ fn main() {
             }
         // --- k3 ---
         } else if stem == "k3_deepgemm_fp8_fp4_grouped_sm100" {
-            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, nvcc) {
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(sm100f_args);
                 nvcc_args.push("-DK3_DEEPGEMM_FP8_FP4_SM100F".to_string());
             } else {
@@ -2337,7 +2328,7 @@ fn main() {
             || stem == "k3_mega_moe_sm100_wide224"
             || stem == "k3_mega_moe_sm100_wide896"
         {
-            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, nvcc) {
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(sm100f_args);
                 nvcc_args.push("-DK3_MEGA_MOE_SM100F".to_string());
             } else {
@@ -2347,7 +2338,7 @@ fn main() {
                 nvcc_args.extend(arch_args.clone());
             }
         } else if stem == "k3_flash_kda" {
-            if let Some(kda_args) = k3_flash_kda_arch_args(&nvcc_sm_targets, nvcc) {
+            if let Some(kda_args) = k3_flash_kda_arch_args(&nvcc_sm_targets, &nvcc) {
                 let flash_kda = root.join("third_party/flash-kda/csrc");
                 nvcc_args.extend(kda_args);
                 // Upstream setup.py flags (torch adds -std=c++17); fast_math
@@ -2380,7 +2371,7 @@ fn main() {
             // FlashMLA's SM100 dense FMHA forward rides in single-TU like the
             // sparse decode shim; the gather/expand helpers in the same file
             // compile either way.
-            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, nvcc) {
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 let flashmla = root.join("third_party/FlashMLA/csrc");
                 nvcc_args.extend(sm100f_args);
                 nvcc_args.extend(
@@ -2674,7 +2665,7 @@ fn main() {
             &cuda_include,
             &arch_args,
             &sm_targets,
-            nvcc,
+            &nvcc,
         ));
     } else {
         println!(
@@ -2688,7 +2679,7 @@ fn main() {
             &cuda_include,
             &arch_args,
             &sm_targets,
-            nvcc,
+            &nvcc,
         ));
         // The vendored FlashKDA sources ride into csrc/k3/k3_flash_kda.cu by
         // include; csrc rerun tracking does not see them.
@@ -2727,7 +2718,7 @@ fn main() {
                         };
 
                         let status = time_phase(format!("nvcc {}", task.cu_file.display()), || {
-                            nvcc.command()
+                            nvcc_command(&nvcc)
                                 .args(&task.args)
                                 .status()
                                 .unwrap_or_else(|_| {
@@ -2782,7 +2773,7 @@ fn main() {
     // entirely unless PEGAINFER_KERNEL_LAB is set, so default builds run zero
     // extra commands and zero extra link lines.
     if std::env::var_os("PEGAINFER_KERNEL_LAB").is_some() {
-        link_kernel_lab_shared(nvcc, &toolkit, &out_dir, &kernel_lab_objs);
+        link_kernel_lab_shared(&nvcc, &toolkit, &out_dir, &kernel_lab_objs);
     }
 
     if qwen35_enabled {

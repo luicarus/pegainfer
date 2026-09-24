@@ -1,8 +1,6 @@
 use std::env;
-use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Finds a package's install root: probes `$env_var` first, then each of
 /// `default_paths`, for any of the `check_files` — several cover layout
@@ -68,75 +66,17 @@ fn target_dirs() -> Vec<String> {
 /// NVIDIA HPC SDK layouts; runtime loading (`LD_LIBRARY_PATH`, rpath) is out of scope.
 pub struct CudaToolkit {
     pub root: PathBuf,
-    /// The `nvcc` invocation to drive this toolkit.
-    pub nvcc: NvccCommand,
+    /// `{root}/bin/nvcc` when present, otherwise bare `nvcc` from `$PATH`.
+    pub nvcc: PathBuf,
     pub include_dirs: Vec<PathBuf>,
     lib_dirs: Vec<PathBuf>,
-}
-
-/// The `nvcc` invocation, optionally wrapped by a compiler launcher.
-///
-/// A launcher sits in front of `nvcc` the way `RUSTC_WRAPPER` sits in front of
-/// `rustc`: the launcher gets the chance to answer out of its cache before the
-/// real compiler runs. `sccache` caches `nvcc` — it decomposes the call with
-/// `nvcc --dryrun` and caches the `cicc`/`ptxas`/`cudafe++`/host-compiler
-/// sub-invocations — but only when it is the process that starts `nvcc`. The
-/// build script spawns `nvcc` directly, so without this the CUDA translation
-/// units are recompiled from cold in every fresh checkout.
-///
-/// `program` plus `launcher` is the argv prefix: `["sccache", "nvcc"]` runs
-/// `sccache nvcc ...`, and an unset `launcher` runs `nvcc ...` unchanged.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NvccCommand {
-    /// The launcher to place before the compiler, absent when unset.
-    pub launcher: Option<OsString>,
-    /// `{root}/bin/nvcc` when present, otherwise bare `nvcc` from `$PATH`.
-    pub program: PathBuf,
-}
-
-impl NvccCommand {
-    /// The environment variable naming a launcher to place in front of `nvcc`.
-    ///
-    /// Unset or empty leaves the invocation exactly as before.
-    const LAUNCHER_ENV: &'static str = "PEGAINFER_NVCC_LAUNCHER";
-
-    fn new(program: PathBuf, launcher: Option<OsString>) -> Self {
-        Self { launcher, program }
-    }
-
-    /// Reads the launcher from the environment, treating an empty value as unset.
-    pub fn launcher_from_env() -> Option<OsString> {
-        env::var_os(Self::LAUNCHER_ENV).filter(|value| !value.is_empty())
-    }
-
-    /// Spawns this invocation with `args`.
-    ///
-    /// Every `nvcc` call site goes through here so the launcher applies to all
-    /// of them — the arch probes as well as the translation-unit compiles.
-    pub fn command(&self) -> Command {
-        let Some(launcher) = &self.launcher else {
-            // No launcher: `nvcc` is the program, not an argument to itself.
-            return Command::new(&self.program);
-        };
-        let mut command = Command::new(launcher);
-        command.arg(&self.program);
-        command
-    }
-
-    /// The program name to show in diagnostics, including the launcher.
-    pub fn display(&self) -> String {
-        self.launcher.as_ref().map_or_else(
-            || self.program.display().to_string(),
-            |launcher| format!("{} {}", launcher.to_string_lossy(), self.program.display()),
-        )
-    }
 }
 
 impl CudaToolkit {
     pub fn discover() -> Self {
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
-        println!("cargo:rerun-if-env-changed={}", NvccCommand::LAUNCHER_ENV);
+        println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_LAUNCHER");
         let env_root = env::var("CUDA_HOME")
             .or_else(|_| env::var("CUDA_PATH"))
             .ok();
@@ -146,17 +86,16 @@ impl CudaToolkit {
             );
         }
         let root = env_root.map_or_else(|| PathBuf::from("/usr/local/cuda"), PathBuf::from);
-        Self::from_root(root, NvccCommand::launcher_from_env())
+        Self::from_root(root)
     }
 
-    fn from_root(root: PathBuf, launcher: Option<OsString>) -> Self {
+    fn from_root(root: PathBuf) -> Self {
         let nvcc = root.join("bin/nvcc");
         let nvcc = if nvcc.is_file() {
             nvcc
         } else {
             PathBuf::from("nvcc")
         };
-        let nvcc = NvccCommand::new(nvcc, launcher);
 
         let mut include_dirs = vec![root.join("include")];
         let mut lib_dirs = vec![root.join("lib64"), root.join("lib")];
@@ -260,8 +199,8 @@ mod tests {
         let lib64 = tree.mkdirs("lib64");
         tree.mkdirs("lib64/stubs");
 
-        let tk = CudaToolkit::from_root(tree.root().to_path_buf(), None);
-        assert_eq!(tk.nvcc.program, tree.root().join("bin/nvcc"));
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
+        assert_eq!(tk.nvcc, tree.root().join("bin/nvcc"));
         assert_eq!(tk.header_dir("cuda.h"), Some(tree.root().join("include")));
         assert_eq!(tk.lib_dirs, vec![lib64.clone()]);
         assert!(lib64.join("stubs").is_dir());
@@ -276,8 +215,8 @@ mod tests {
         let lib = tree.mkdirs("lib");
         let targets_lib = tree.mkdirs(&format!("targets/{target}/lib"));
 
-        let tk = CudaToolkit::from_root(tree.root().to_path_buf(), None);
-        assert_eq!(tk.nvcc.program, PathBuf::from("nvcc"));
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
+        assert_eq!(tk.nvcc, PathBuf::from("nvcc"));
         assert_eq!(
             tk.header_dir("cuda.h"),
             Some(tree.root().join(format!("targets/{target}/include")))
@@ -292,10 +231,7 @@ mod tests {
         let lib64 = tree.mkdirs("release/cuda/12.6/lib64");
         let math = tree.mkdirs("release/math_libs/12.6/lib64");
 
-        assert_eq!(
-            CudaToolkit::from_root(root, None).lib_dirs,
-            vec![lib64, math]
-        );
+        assert_eq!(CudaToolkit::from_root(root).lib_dirs, vec![lib64, math]);
     }
 
     #[cfg(unix)]
@@ -316,7 +252,7 @@ mod tests {
         )
         .unwrap();
 
-        let tk = CudaToolkit::from_root(tree.root().to_path_buf(), None);
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
         assert_eq!(tk.include_dirs.len(), 1);
         assert_eq!(tk.lib_dirs.len(), 1);
         assert_eq!(tk.header_dir("cuda.h"), Some(tree.root().join("include")));
@@ -327,7 +263,7 @@ mod tests {
         let tree = TempTree::new();
         tree.mkdirs("weird/place");
 
-        let tk = CudaToolkit::from_root(tree.root().to_path_buf(), None);
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
         assert!(tk.lib_dirs.is_empty());
         assert!(tk.include_dirs.is_empty());
         assert_eq!(tk.header_dir("cuda.h"), None);
@@ -359,101 +295,6 @@ mod tests {
             "PEGAINFER_TEST_UNSET_ENV",
             &[&root_str],
             &["include/cuda.h"],
-        );
-    }
-
-    /// Builds an `NvccCommand` directly so the argv assembly is exercised without
-    /// touching the process environment.
-    fn nvcc_with(launcher: Option<&str>, program: &str) -> NvccCommand {
-        NvccCommand {
-            launcher: launcher.map(OsString::from),
-            program: PathBuf::from(program),
-        }
-    }
-
-    fn argv_of(command: &Command) -> Vec<String> {
-        let mut argv = vec![command.get_program().to_string_lossy().into_owned()];
-        argv.extend(
-            command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned()),
-        );
-        argv
-    }
-
-    #[test]
-    fn without_a_launcher_nvcc_is_invoked_directly() {
-        let command = nvcc_with(None, "nvcc").command();
-        assert_eq!(
-            argv_of(&command),
-            vec!["nvcc"],
-            "an unset launcher must leave the invocation unchanged"
-        );
-    }
-
-    #[test]
-    fn with_a_launcher_nvcc_becomes_the_launcher_argument() {
-        let command = nvcc_with(Some("sccache"), "nvcc").command();
-        assert_eq!(
-            argv_of(&command),
-            vec!["sccache", "nvcc"],
-            "the launcher is started and receives nvcc as its argument"
-        );
-    }
-
-    #[test]
-    fn launcher_argv_prefix_survives_arguments() {
-        let mut command = nvcc_with(Some("sccache"), "nvcc").command();
-        command.args(["-c", "kernel.cu", "-o", "kernel_cuda.o"]);
-        assert_eq!(
-            argv_of(&command),
-            vec!["sccache", "nvcc", "-c", "kernel.cu", "-o", "kernel_cuda.o"]
-        );
-    }
-
-    #[test]
-    fn display_names_the_launcher_when_present() {
-        assert_eq!(nvcc_with(None, "nvcc").display(), "nvcc");
-        assert_eq!(nvcc_with(Some("sccache"), "nvcc").display(), "sccache nvcc");
-    }
-
-    /// An empty value counts as unset, so exporting `PEGAINFER_NVCC_LAUNCHER=`
-    /// does not yield an empty launcher.
-    ///
-    /// This is the only test that touches the env var. It restores whatever the
-    /// harness started with, so no lock is needed to keep other tests isolated.
-    #[test]
-    fn launcher_from_env_treats_an_empty_value_as_unset() {
-        let previous = env::var_os(NvccCommand::LAUNCHER_ENV);
-        unsafe { env::set_var(NvccCommand::LAUNCHER_ENV, "") };
-        assert_eq!(NvccCommand::launcher_from_env(), None);
-        unsafe { env::set_var(NvccCommand::LAUNCHER_ENV, "sccache") };
-        assert_eq!(
-            NvccCommand::launcher_from_env(),
-            Some(OsString::from("sccache"))
-        );
-        match previous {
-            Some(previous) => unsafe { env::set_var(NvccCommand::LAUNCHER_ENV, previous) },
-            None => unsafe { env::remove_var(NvccCommand::LAUNCHER_ENV) },
-        }
-    }
-
-    /// End-to-end over a fake toolkit tree: discovery finds `bin/nvcc` and hands
-    /// the launcher it was given to the resulting invocation.
-    #[test]
-    fn discovered_toolkit_places_the_launcher_before_its_nvcc() {
-        let tree = TempTree::new();
-        tree.touch("bin/nvcc");
-        tree.mkdirs("lib64");
-
-        let tk = CudaToolkit::from_root(tree.root().to_path_buf(), Some(OsString::from("sccache")));
-        assert_eq!(tk.nvcc.launcher, Some(OsString::from("sccache")));
-        assert_eq!(
-            argv_of(&tk.nvcc.command()),
-            vec![
-                "sccache".to_string(),
-                tree.root().join("bin/nvcc").to_string_lossy().into_owned()
-            ],
         );
     }
 }
