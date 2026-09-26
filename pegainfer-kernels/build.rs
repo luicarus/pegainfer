@@ -348,6 +348,7 @@ fn parse_sm_token(raw: &str) -> Option<String> {
 
 /// `nvcc`, prefixed by `PEGAINFER_NVCC_LAUNCHER` when that is set and non-empty.
 fn nvcc_command(nvcc: &str) -> Command {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_LAUNCHER");
     match std::env::var_os("PEGAINFER_NVCC_LAUNCHER").filter(|value| !value.is_empty()) {
         Some(launcher) => {
             let mut command = Command::new(launcher);
@@ -2721,8 +2722,11 @@ fn main() {
                             nvcc_command(&nvcc)
                                 .args(&task.args)
                                 .status()
-                                .unwrap_or_else(|_| {
-                                    panic!("Failed to run nvcc for {}", task.cu_file.display())
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "Failed to run nvcc for {}: {err}",
+                                        task.cu_file.display()
+                                    )
                                 })
                         });
                         completed.push((task.cu_file, task.obj_file, status));

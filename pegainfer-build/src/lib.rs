@@ -76,7 +76,6 @@ impl CudaToolkit {
     pub fn discover() -> Self {
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
-        println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_LAUNCHER");
         let env_root = env::var("CUDA_HOME")
             .or_else(|_| env::var("CUDA_PATH"))
             .ok();
